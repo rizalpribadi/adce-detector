@@ -1,6 +1,11 @@
 """
-ADCE Missing Neighbor Detector — Streamlit App
-================================================
+ADCE Missing Neighbor Detector — Streamlit App (v2)
+=====================================================
+Key features:
+  - Fixed or ISD-based threshold (auto per-site density)
+  - Hard cap MAX 34 neighbors per source cell
+  - Priority: nearest first (Priority_Rank column)
+  - Slots_Available = 34 - existing_count
 Usage: streamlit run app.py
 """
 import streamlit as st
@@ -10,7 +15,6 @@ from sklearn.neighbors import BallTree
 import math
 import folium
 from streamlit_folium import st_folium
-import io
 
 st.set_page_config(
     page_title="ADCE Missing Neighbor Detector",
@@ -19,9 +23,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ═══════════════════════════════════════════
-#  HELPERS
-# ═══════════════════════════════════════════
+MAX_NEIGHBORS_PER_CELL = 34
 EARTH_R = 6371.0
 
 def haversine(lat1, lon1, lat2, lon2):
@@ -33,7 +35,7 @@ def az_offset(lat, lon, azimuth, dist_deg):
     rad = math.radians(azimuth)
     return lat + dist_deg*math.cos(rad), lon + dist_deg*math.sin(rad)/math.cos(math.radians(lat))
 
-def draw_sector(m_layer, lat, lon, azimuth, beamwidth, radius_deg, color, fill_opacity, popup_text):
+def draw_sector(layer, lat, lon, azimuth, beamwidth, radius_deg, color, fill_opacity, popup_text):
     bw = min(beamwidth, 120)
     points = [(lat, lon)]
     for angle in np.arange(azimuth-bw/2, azimuth+bw/2+1, 2):
@@ -43,7 +45,7 @@ def draw_sector(m_layer, lat, lon, azimuth, beamwidth, radius_deg, color, fill_o
     points.append((lat, lon))
     folium.Polygon(locations=points, color=color, weight=1.5,
                    fill=True, fill_color=color, fill_opacity=fill_opacity,
-                   popup=folium.Popup(popup_text, max_width=350)).add_to(m_layer)
+                   popup=folium.Popup(popup_text, max_width=350)).add_to(layer)
 
 @st.cache_data
 def load_gcell(file):
@@ -67,26 +69,46 @@ def load_adce(file):
     return df
 
 @st.cache_data
-def detect_missing(gcell, adce_set_list, urban_km, suburban_km, rural_km, suburban_list,
-                   filter_bsc, filter_kab, filter_site, exclude_ibc):
+def compute_isd_thresholds(gcell_df, isd_mult, isd_min, isd_max, isd_n, exclude_ibc):
+    work = gcell_df[gcell_df['Site_Type']=='MACRO'].copy() if exclude_ibc else gcell_df.copy()
+    sites = work.drop_duplicates('SiteID')[['SiteID','Latitude','Longitude']].reset_index(drop=True)
+    if len(sites) < 2:
+        return {}
+    coords = np.radians(sites[['Latitude','Longitude']].values)
+    tree = BallTree(coords, metric='haversine')
+    k = min(isd_n + 1, len(sites))
+    dists, _ = tree.query(coords, k=k)
+    avg_isd = (dists[:, 1:] * EARTH_R).mean(axis=1)
+    sites['avg_isd_km'] = avg_isd
+    sites['threshold_km'] = np.clip(avg_isd * isd_mult, isd_min, isd_max).round(2)
+    sites['area_type'] = pd.cut(avg_isd, bins=[0, 0.7, 2.0, 999],
+                                 labels=['Dense Urban','Urban/Suburban','Rural']).astype(str)
+    return sites.set_index('SiteID')[['threshold_km','area_type','avg_isd_km']].to_dict('index')
+
+def detect_missing(gcell, adce_set_list, mode,
+                   urban_km, suburban_km, rural_km, suburban_list,
+                   isd_mult, isd_min, isd_max, isd_n,
+                   max_neighbors, filter_bsc, filter_kab, filter_site, exclude_ibc):
     adce_set = set(adce_set_list)
     work = gcell.copy()
     if exclude_ibc:
         work = work[work['Site_Type'] == 'MACRO']
 
-    # Classify
-    sub_upper = [s.upper() for s in suburban_list]
-    def get_threshold(kab):
-        if kab.startswith('KOTA'):
-            return urban_km, 'Urban'
-        elif kab in sub_upper:
-            return suburban_km, 'Suburban'
-        return rural_km, 'Rural'
+    if mode == 'ISD':
+        site_threshold = compute_isd_thresholds(gcell, isd_mult, isd_min, isd_max, isd_n, exclude_ibc)
+    else:
+        sub_upper = [s.upper() for s in suburban_list]
+        def classify(kab):
+            if kab.startswith('KOTA'):
+                return urban_km, 'Urban'
+            elif kab in sub_upper:
+                return suburban_km, 'Suburban'
+            return rural_km, 'Rural'
+        site_threshold = {}
+        for _, r in work.drop_duplicates('SiteID').iterrows():
+            t, a = classify(r['Kabupaten'])
+            site_threshold[r['SiteID']] = {'threshold_km': t, 'area_type': a}
 
-    work[['threshold_km','area_type']] = work['Kabupaten'].apply(
-        lambda k: pd.Series(get_threshold(k)))
-
-    # Apply filters
     if filter_bsc:
         work = work[work['BSC'] == filter_bsc]
     if filter_kab:
@@ -97,34 +119,31 @@ def detect_missing(gcell, adce_set_list, urban_km, suburban_km, rural_km, suburb
     if len(work) == 0:
         return pd.DataFrame(), pd.DataFrame()
 
-    # All cells for target
-    all_cells = gcell[['LAC_CI','Cellname','SiteID','Latitude','Longitude',
-                       'azimuth','beamwidth','Kabupaten','BSC']].reset_index(drop=True)
-    if exclude_ibc:
-        all_cells = gcell[gcell['Site_Type']=='MACRO'][
-            ['LAC_CI','Cellname','SiteID','Latitude','Longitude',
-             'azimuth','beamwidth','Kabupaten','BSC']].reset_index(drop=True)
-
+    all_cells_full = gcell[gcell['Site_Type']=='MACRO'] if exclude_ibc else gcell
+    all_cells = all_cells_full[['LAC_CI','Cellname','SiteID','Latitude','Longitude',
+                                 'azimuth','beamwidth','Kabupaten','BSC']].reset_index(drop=True)
     coords_rad = np.radians(all_cells[['Latitude','Longitude']].values)
     tree = BallTree(coords_rad, metric='haversine')
 
     src_cells = work[['LAC_CI','Cellname','SiteID','Latitude','Longitude',
-                      'azimuth','beamwidth','Kabupaten','BSC','threshold_km','area_type']].reset_index(drop=True)
+                      'azimuth','beamwidth','Kabupaten','BSC']].reset_index(drop=True)
 
-    max_threshold = work['threshold_km'].max()
+    max_threshold = max((v['threshold_km'] for v in site_threshold.values()), default=5.0)
     src_coords_rad = np.radians(src_cells[['Latitude','Longitude']].values)
     indices_list = tree.query_radius(src_coords_rad, r=max_threshold/EARTH_R)
 
-    # Site → threshold lookup
-    site_threshold = work.drop_duplicates('SiteID').set_index('SiteID')[['threshold_km','area_type']].to_dict('index')
+    src_existing_count = {}
+    for s, t in adce_set:
+        src_existing_count[s] = src_existing_count.get(s, 0) + 1
 
     missing = []
     for i, neighbors in enumerate(indices_list):
         src = src_cells.iloc[i]
-        st_info = site_threshold.get(src['SiteID'], {'threshold_km': rural_km, 'area_type': 'Rural'})
+        st_info = site_threshold.get(src['SiteID'], {'threshold_km': 5.0, 'area_type': 'Unknown'})
         threshold = st_info['threshold_km']
-        area_type = st_info['area_type']
+        area_type = str(st_info['area_type'])
 
+        cands = []
         for j in neighbors:
             tgt = all_cells.iloc[j]
             if src['SiteID'] == tgt['SiteID']:
@@ -134,13 +153,23 @@ def detect_missing(gcell, adce_set_list, urban_km, suburban_km, rural_km, suburb
                 continue
             if (src['LAC_CI'], tgt['LAC_CI']) in adce_set:
                 continue
+            cands.append((dist, tgt))
 
+        cands.sort(key=lambda x: x[0])
+        existing_cnt = src_existing_count.get(src['LAC_CI'], 0)
+        slots = max(0, max_neighbors - existing_cnt)
+        cands = cands[:slots]
+
+        for rank, (dist, tgt) in enumerate(cands, start=1):
             missing.append({
                 'Source_Cell': src['Cellname'],
                 'Source_SiteID': src['SiteID'],
                 'Source_LAC_CI': src['LAC_CI'],
                 'Source_Azimuth': int(src['azimuth']),
                 'Source_BSC': src['BSC'],
+                'Existing_Neighbors': existing_cnt,
+                'Slots_Available': slots,
+                'Priority_Rank': rank,
                 'Target_Cell': tgt['Cellname'],
                 'Target_SiteID': tgt['SiteID'],
                 'Target_LAC_CI': tgt['LAC_CI'],
@@ -155,7 +184,6 @@ def detect_missing(gcell, adce_set_list, urban_km, suburban_km, rural_km, suburb
     if len(df_missing) == 0:
         return df_missing, pd.DataFrame()
 
-    # Site summary
     lacci_to_site = gcell.set_index('LAC_CI')['SiteID'].to_dict()
     adce_df = pd.DataFrame(list(adce_set), columns=['src','tgt'])
     adce_df['src_site'] = adce_df['src'].map(lacci_to_site)
@@ -170,7 +198,6 @@ def detect_missing(gcell, adce_set_list, urban_km, suburban_km, rural_km, suburb
         kabupaten=('Kabupaten','first'),
         source_bsc=('Source_BSC','first'),
     ).reset_index()
-
     site_summary = site_summary.merge(
         existing_counts,
         left_on=['Source_SiteID','Target_SiteID'],
@@ -181,7 +208,7 @@ def detect_missing(gcell, adce_set_list, urban_km, suburban_km, rural_km, suburb
     site_summary['priority'] = site_summary['existing_count'].apply(
         lambda x: 'CRITICAL' if x == 0 else 'PARTIAL')
 
-    return df_missing.sort_values(['Source_BSC','Source_SiteID','Distance_km']), \
+    return df_missing.sort_values(['Source_BSC','Source_SiteID','Source_Cell','Priority_Rank']), \
            site_summary.sort_values(['priority','min_dist'])
 
 
@@ -206,10 +233,16 @@ def build_map(gcell, adce_set, df_missing, focus_site, radius_km):
             'name': c['Cellname'], 'site': c['SiteID']
         }
 
+    missing_pairs = set()
+    if df_missing is not None and len(df_missing) > 0:
+        focus_missing = df_missing[df_missing['Source_SiteID'] == focus_site]
+        for _, row in focus_missing.iterrows():
+            missing_pairs.add((row['Source_LAC_CI'], row['Target_LAC_CI']))
+
     m = folium.Map(location=[center_lat, center_lon], zoom_start=15, tiles='CartoDB positron')
     lg_sectors  = folium.FeatureGroup(name='📡 Cell sectors', show=True)
     lg_existing = folium.FeatureGroup(name='🟢 Existing ADCE', show=True)
-    lg_missing  = folium.FeatureGroup(name='🔴 Missing ADCE', show=True)
+    lg_missing  = folium.FeatureGroup(name='🔴 Missing ADCE (prioritized)', show=True)
     lg_labels   = folium.FeatureGroup(name='🏷️ Site labels', show=True)
 
     BEAM_LEN = 0.0012
@@ -218,8 +251,7 @@ def build_map(gcell, adce_set, df_missing, focus_site, radius_km):
     for _, cell in nearby_cells.iterrows():
         is_focus = cell['SiteID'] == focus_site
         color = '#e74c3c' if is_focus else '#27ae60'
-        popup = (f"<b>{cell['Cellname']}</b><br>"
-                 f"LAC_CI: {cell['LAC_CI']}<br>"
+        popup = (f"<b>{cell['Cellname']}</b><br>LAC_CI: {cell['LAC_CI']}<br>"
                  f"Az: {int(cell['azimuth'])}° | BW: {int(cell['beamwidth'])}°")
         draw_sector(lg_sectors, cell['Latitude'], cell['Longitude'],
                     cell['azimuth'], cell['beamwidth'],
@@ -242,7 +274,6 @@ def build_map(gcell, adce_set, df_missing, focus_site, radius_km):
                 icon_size=(0,0), icon_anchor=(0,-18))
         ).add_to(lg_labels)
 
-    # Existing ADCE lines
     existing_drawn = set()
     for src_lacci in focus_lacci:
         src = cell_info.get(src_lacci)
@@ -261,26 +292,21 @@ def build_map(gcell, adce_set, df_missing, focus_site, radius_km):
                             color='#2ecc71', weight=2.5, opacity=0.85, dash_array='8,4',
                             popup=folium.Popup(popup, max_width=300)).add_to(lg_existing)
 
-    # Missing ADCE lines
     missing_drawn = set()
-    for src_lacci in focus_lacci:
+    for src_lacci, tgt_lacci in missing_pairs:
         src = cell_info.get(src_lacci)
-        if not src: continue
-        for tgt_lacci, tgt in cell_info.items():
-            if tgt['site'] == focus_site: continue
-            if (src_lacci, tgt_lacci) in adce_set: continue
-            dist = haversine(src['lat'], src['lon'], tgt['lat'], tgt['lon'])
-            if dist > radius_km: continue
-            key = (src_lacci, tgt_lacci)
-            if key in missing_drawn: continue
-            missing_drawn.add(key)
-            src_tip = az_offset(src['lat'], src['lon'], src['az'], LINE_OFFSET)
-            tgt_tip = az_offset(tgt['lat'], tgt['lon'], tgt['az'], LINE_OFFSET)
-            popup = (f"❌ <b>MISSING</b><br><b>Src:</b> {src['name']}<br>"
-                     f"<b>Tgt:</b> {tgt['name']}<br>Dist: {dist:.2f} km")
-            folium.PolyLine(locations=[src_tip, tgt_tip],
-                            color='#e74c3c', weight=2, opacity=0.6, dash_array='4,6',
-                            popup=folium.Popup(popup, max_width=300)).add_to(lg_missing)
+        tgt = cell_info.get(tgt_lacci)
+        if not src or not tgt: continue
+        if (src_lacci, tgt_lacci) in missing_drawn: continue
+        missing_drawn.add((src_lacci, tgt_lacci))
+        src_tip = az_offset(src['lat'], src['lon'], src['az'], LINE_OFFSET)
+        tgt_tip = az_offset(tgt['lat'], tgt['lon'], tgt['az'], LINE_OFFSET)
+        dist = haversine(src['lat'], src['lon'], tgt['lat'], tgt['lon'])
+        popup = (f"❌ <b>MISSING</b><br><b>Src:</b> {src['name']}<br>"
+                 f"<b>Tgt:</b> {tgt['name']}<br>Dist: {dist:.2f} km")
+        folium.PolyLine(locations=[src_tip, tgt_tip],
+                        color='#e74c3c', weight=2, opacity=0.7, dash_array='4,6',
+                        popup=folium.Popup(popup, max_width=300)).add_to(lg_missing)
 
     lg_sectors.add_to(m); lg_existing.add_to(m); lg_missing.add_to(m); lg_labels.add_to(m)
     folium.LayerControl(collapsed=False).add_to(m)
@@ -289,114 +315,110 @@ def build_map(gcell, adce_set, df_missing, focus_site, radius_km):
          padding:14px 18px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.25);
          font-size:12px;line-height:2">
       <b style="font-size:14px">🗺️ {focus_site}</b><br>
-      <span style="color:#e74c3c">■</span> Focus site &nbsp;
-      <span style="color:#27ae60">■</span> Neighbors<br>
+      <span style="color:#e74c3c">■</span> Focus &nbsp;<span style="color:#27ae60">■</span> Neighbors<br>
       <span style="color:#2ecc71">━━</span> Existing ({len(existing_drawn)}) &nbsp;
       <span style="color:#e74c3c">╌╌</span> Missing ({len(missing_drawn)})
     </div>"""
     m.get_root().html.add_child(folium.Element(legend))
-
     return m
 
-# ═══════════════════════════════════════════
-#  SIDEBAR
-# ═══════════════════════════════════════════
+# ─── SIDEBAR ───
 with st.sidebar:
     st.title("📡 ADCE Detector")
-    st.caption("Missing Neighbor Detection for 2G GSM")
+    st.caption("Missing Neighbor Detection — 2G GSM")
 
     st.subheader("📂 Upload files")
     gcell_file = st.file_uploader("GCELL (cell reference)", type=['txt','csv'], key='gcell')
     adce_file = st.file_uploader("ADCE (neighbor list)", type=['txt','csv'], key='adce')
 
     st.divider()
-    st.subheader("⚙️ Threshold settings")
+    st.subheader("⚙️ Threshold mode")
+    mode = st.radio("mode", ['Fixed','ISD'], horizontal=True, label_visibility='collapsed',
+                    help="Fixed: by Kabupaten name. ISD: auto by local density (recommended).")
 
-    threshold_mode = st.radio("Mode", ['Fixed','ISD (auto)'], horizontal=True)
-
-    if threshold_mode == 'Fixed':
+    if mode == 'Fixed':
         col1, col2, col3 = st.columns(3)
-        urban_km = col1.number_input("Urban", 0.1, 10.0, 1.0, 0.1, help="KOTA*")
+        urban_km = col1.number_input("Urban", 0.1, 10.0, 1.0, 0.1)
         suburban_km = col2.number_input("Suburban", 0.1, 10.0, 2.0, 0.1)
         rural_km = col3.number_input("Rural", 0.1, 15.0, 5.0, 0.5)
-
         suburban_input = st.text_input(
-            "Suburban kabupaten (comma separated)",
-            "DELI SERDANG, KARO, SIMALUNGUN, LANGKAT, SERDANG BEDAGAI",
-            help="Kabupaten yang diklasifikasi suburban"
+            "Suburban kabupaten",
+            "DELI SERDANG, KARO, SIMALUNGUN, LANGKAT, SERDANG BEDAGAI, ACEH BESAR",
+            help="KOTA* = Urban; sisanya = Rural"
         )
         suburban_list = [s.strip().upper() for s in suburban_input.split(',') if s.strip()]
+        isd_mult, isd_min, isd_max, isd_n = 2.0, 0.5, 5.0, 3
     else:
+        st.caption("threshold = avg ISD × multiplier, clipped to [min, max]")
         col1, col2 = st.columns(2)
-        isd_mult = col1.number_input("ISD multiplier", 1.0, 5.0, 2.0, 0.5)
-        isd_neighbors = col2.number_input("Nearest N", 1, 10, 3, 1)
+        isd_mult = col1.number_input("Multiplier", 1.0, 5.0, 2.0, 0.5)
+        isd_n = col2.number_input("Nearest N", 1, 10, 3, 1)
         col3, col4 = st.columns(2)
         isd_min = col3.number_input("Min km", 0.1, 5.0, 0.5, 0.1)
         isd_max = col4.number_input("Max km", 1.0, 15.0, 5.0, 0.5)
-        # Placeholder — use fixed for now
         urban_km, suburban_km, rural_km = 1.0, 2.0, 5.0
         suburban_list = []
 
     st.divider()
-    st.subheader("🔍 Filters")
+    st.subheader("🎯 Neighbor cap")
+    max_neighbors = st.number_input("Max neighbors per cell", 1, 64, MAX_NEIGHBORS_PER_CELL, 1,
+                                     help="Slots = cap − existing count. Only top-N nearest suggested.")
+
+    st.divider()
     exclude_ibc = st.checkbox("Exclude IBC (indoor)", value=True)
 
-# ═══════════════════════════════════════════
-#  MAIN AREA
-# ═══════════════════════════════════════════
 if not gcell_file or not adce_file:
     st.markdown("## 📡 ADCE Missing Neighbor Detector")
     st.info("Upload **GCELL** dan **ADCE** file di sidebar untuk memulai.")
-
-    with st.expander("ℹ️ Cara penggunaan"):
+    with st.expander("ℹ️ Fitur baru v2"):
         st.markdown("""
-        **Step 1:** Upload file GCELL (cell reference) dan ADCE (neighbor list) di sidebar
+        **Threshold:**
+        - **Fixed** — by Kabupaten (Urban/Suburban/Rural)
+        - **ISD (auto)** — per-site threshold by local density
 
-        **Step 2:** Set threshold jarak per area type (Urban / Suburban / Rural)
+        **Neighbor cap (default 34):**
+        - Slots = 34 − existing count per source cell
+        - Candidates sorted by distance (nearest first)
+        - Only top-N within slots are suggested
 
-        **Step 3:** Pilih tab:
-        - **Detect All** — jalankan deteksi untuk semua site, download CSV
-        - **Site Inspector** — pilih site ID, lihat map interaktif
-        - **Summary** — ringkasan statistik
+        **New output columns:**
+        - `Existing_Neighbors` — current ADCE count
+        - `Slots_Available` — sisa slot (34 − existing)
+        - `Priority_Rank` — 1 = paling dekat
         """)
     st.stop()
 
-# Load data
 gcell = load_gcell(gcell_file)
 adce = load_adce(adce_file)
 adce_set = set(zip(adce['LAC_CI_Source'], adce['LAC_CI_Target']))
 adce_set_list = list(adce_set)
 
-# Sidebar filters (need data loaded first)
 with st.sidebar:
+    st.subheader("🔍 Filters")
     bsc_list = [''] + sorted(gcell['BSC'].unique().tolist())
-    filter_bsc = st.selectbox("Filter BSC", bsc_list, help="Kosongkan = semua")
-
+    filter_bsc = st.selectbox("BSC", bsc_list)
     kab_list = [''] + sorted(gcell['Kabupaten'].unique().tolist())
-    filter_kab = st.selectbox("Filter Kabupaten", kab_list)
+    filter_kab = st.selectbox("Kabupaten", kab_list)
+    filter_site = st.text_input("Site ID", '', placeholder="e.g. 01JHO0044")
 
-    filter_site = st.text_input("Filter Site ID", '', placeholder="e.g. 02MDN0268")
-
-# Data stats in sidebar
-with st.sidebar:
     st.divider()
-    st.caption(f"📊 Loaded: {len(gcell):,} cells | {gcell['SiteID'].nunique():,} sites")
+    st.caption(f"📊 {len(gcell):,} cells | {gcell['SiteID'].nunique():,} sites")
     st.caption(f"🔗 ADCE: {len(adce_set):,} relations")
 
-# ═══════════════════════════════════════════
-#  TABS
-# ═══════════════════════════════════════════
 tab1, tab2, tab3 = st.tabs(["🔎 Detect all", "🗺️ Site inspector", "📊 Summary"])
 
-# ── TAB 1: DETECT ALL ──
+# Tab 1
 with tab1:
     st.subheader("Detect missing ADCE — all sites")
+    st.caption(f"Capped at max {max_neighbors} neighbors per cell, prioritized by distance (nearest first).")
 
     if st.button("▶ Run detection", type="primary", use_container_width=True):
-        with st.spinner("Detecting missing neighbors..."):
+        with st.spinner("Detecting..."):
             df_missing, site_summary = detect_missing(
-                gcell, adce_set_list,
+                gcell, adce_set_list, mode,
                 urban_km, suburban_km, rural_km, suburban_list,
+                isd_mult, isd_min, isd_max, isd_n,
+                max_neighbors,
                 filter_bsc, filter_kab, filter_site, exclude_ibc
             )
             st.session_state['df_missing'] = df_missing
@@ -406,105 +428,86 @@ with tab1:
         df_missing = st.session_state['df_missing']
         site_summary = st.session_state['site_summary']
 
-        # Metrics
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Total missing", f"{len(df_missing):,}")
-        col2.metric("Site pairs", f"{len(site_summary):,}")
-        col3.metric("Critical", f"{(site_summary['priority']=='CRITICAL').sum():,}")
-        col4.metric("Partial", f"{(site_summary['priority']=='PARTIAL').sum():,}")
+        col2.metric("Affected cells", f"{df_missing['Source_Cell'].nunique():,}")
+        col3.metric("Critical pairs", f"{(site_summary['priority']=='CRITICAL').sum():,}")
+        col4.metric("Partial pairs", f"{(site_summary['priority']=='PARTIAL').sum():,}")
 
-        # Area breakdown
         st.markdown("**By area type:**")
         area_stats = df_missing.groupby('Area_Type').agg(
             count=('Source_Cell','size'),
             avg_dist=('Distance_km','mean'),
-            threshold=('Threshold_km','first')
+            avg_rank=('Priority_Rank','mean')
         ).reset_index()
         st.dataframe(area_stats, use_container_width=True, hide_index=True)
 
-        # Downloads
         st.markdown("---")
         col_a, col_b = st.columns(2)
+        col_a.download_button("📥 Download cell detail CSV",
+                              df_missing.to_csv(index=False).encode('utf-8'),
+                              "missing_adce_cell_detail.csv", "text/csv",
+                              use_container_width=True)
+        col_b.download_button("📥 Download site summary CSV",
+                              site_summary.to_csv(index=False).encode('utf-8'),
+                              "missing_adce_site_summary.csv", "text/csv",
+                              use_container_width=True)
 
-        csv_cell = df_missing.to_csv(index=False).encode('utf-8')
-        col_a.download_button(
-            "📥 Download cell detail CSV",
-            csv_cell,
-            "missing_adce_cell_detail.csv",
-            "text/csv",
-            use_container_width=True
-        )
-
-        csv_site = site_summary.to_csv(index=False).encode('utf-8')
-        col_b.download_button(
-            "📥 Download site summary CSV",
-            csv_site,
-            "missing_adce_site_summary.csv",
-            "text/csv",
-            use_container_width=True
-        )
-
-        # Preview
         with st.expander(f"Preview cell detail ({len(df_missing):,} rows)"):
             st.dataframe(df_missing.head(100), use_container_width=True, hide_index=True)
-
         with st.expander(f"Preview site summary ({len(site_summary):,} rows)"):
             st.dataframe(site_summary.head(100), use_container_width=True, hide_index=True)
-
     elif 'df_missing' in st.session_state:
         st.warning("No missing ADCE found with current filters.")
 
-# ── TAB 2: SITE INSPECTOR ──
+# Tab 2
 with tab2:
     st.subheader("Site inspector — interactive map")
-
     col_site, col_radius = st.columns([3, 1])
-
     site_list = sorted(gcell['SiteID'].unique().tolist())
-    default_idx = site_list.index('02MDN0337') if '02MDN0337' in site_list else 0
-
-    selected_site = col_site.selectbox("Select Site ID", site_list, index=default_idx)
-    map_radius = col_radius.number_input("Radius (km)", 0.5, 10.0, 3.0, 0.5)
+    selected_site = col_site.selectbox("Select Site ID", site_list, index=0)
+    map_radius = col_radius.number_input("Map radius (km)", 0.5, 10.0, 3.0, 0.5)
 
     if selected_site:
-        # Site info
         site_cells = gcell[gcell['SiteID'] == selected_site]
-        site_kab = site_cells['Kabupaten'].iloc[0] if len(site_cells) > 0 else '-'
-        site_bsc = site_cells['BSC'].iloc[0] if len(site_cells) > 0 else '-'
-
         col_i1, col_i2, col_i3 = st.columns(3)
-        col_i1.markdown(f"**Kabupaten:** {site_kab}")
-        col_i2.markdown(f"**BSC:** {site_bsc}")
+        col_i1.markdown(f"**Kabupaten:** {site_cells['Kabupaten'].iloc[0]}")
+        col_i2.markdown(f"**BSC:** {site_cells['BSC'].iloc[0]}")
         col_i3.markdown(f"**Cells:** {len(site_cells)}")
 
+        df_missing_for_map = st.session_state.get('df_missing', None)
         with st.spinner("Generating map..."):
-            fmap = build_map(gcell, adce_set, None, selected_site, map_radius)
-
+            fmap = build_map(gcell, adce_set, df_missing_for_map, selected_site, map_radius)
         if fmap:
             st_folium(fmap, use_container_width=True, height=550)
 
-        # Site detail table
-        if 'df_missing' in st.session_state and len(st.session_state['df_missing']) > 0:
-            site_missing = st.session_state['df_missing'][
-                st.session_state['df_missing']['Source_SiteID'] == selected_site]
-
+        if df_missing_for_map is not None and len(df_missing_for_map) > 0:
+            site_missing = df_missing_for_map[df_missing_for_map['Source_SiteID'] == selected_site]
             if len(site_missing) > 0:
-                st.markdown(f"**Missing neighbors from {selected_site}: {len(site_missing)}**")
+                st.markdown(f"**Missing ADCE candidates from {selected_site}: {len(site_missing)} "
+                            f"(after prioritization & cap)**")
+                per_cell = site_missing.groupby('Source_Cell').agg(
+                    existing=('Existing_Neighbors','first'),
+                    slots=('Slots_Available','first'),
+                    suggested=('Source_Cell','size'),
+                    nearest_dist=('Distance_km','min')
+                ).reset_index()
+                st.dataframe(per_cell, use_container_width=True, hide_index=True)
 
-                by_target = site_missing.groupby('Target_SiteID').agg(
-                    missing=('Source_Cell','size'),
-                    min_dist=('Distance_km','min')
-                ).sort_values('min_dist').reset_index()
-                st.dataframe(by_target, use_container_width=True, hide_index=True)
+                with st.expander("Detail (sorted by priority rank)"):
+                    st.dataframe(
+                        site_missing[['Source_Cell','Priority_Rank','Target_Cell',
+                                       'Distance_km','Existing_Neighbors','Slots_Available']],
+                        use_container_width=True, hide_index=True
+                    )
             else:
-                st.success(f"No missing ADCE for {selected_site}")
+                st.success(f"No missing ADCE for {selected_site} (slots full or no candidates in range).")
         else:
-            st.info("Run detection di tab 'Detect all' dulu untuk melihat detail missing per site.")
+            st.info("Run detection di tab 'Detect all' dulu.")
 
-# ── TAB 3: SUMMARY ──
+# Tab 3
 with tab3:
     st.subheader("Summary dashboard")
-
     if 'df_missing' not in st.session_state:
         st.info("Run detection di tab 'Detect all' dulu.")
         st.stop()
@@ -516,7 +519,6 @@ with tab3:
         st.warning("No data.")
         st.stop()
 
-    # Top metrics
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total missing", f"{len(df_missing):,}")
     col2.metric("Affected cells", f"{df_missing['Source_Cell'].nunique():,}")
@@ -524,23 +526,20 @@ with tab3:
     col4.metric("Avg distance", f"{df_missing['Distance_km'].mean():.2f} km")
 
     st.markdown("---")
-
-    # BSC breakdown
     col_l, col_r = st.columns(2)
-
     with col_l:
         st.markdown("**Top 10 BSC by missing count**")
-        bsc_stats = df_missing.groupby('Source_BSC').size().reset_index(name='missing_count')
-        bsc_stats = bsc_stats.sort_values('missing_count', ascending=False).head(10)
+        bsc_stats = df_missing.groupby('Source_BSC').size().reset_index(name='count')
+        bsc_stats = bsc_stats.sort_values('count', ascending=False).head(10)
         st.bar_chart(bsc_stats.set_index('Source_BSC'))
-
     with col_r:
-        st.markdown("**By area type**")
-        area_pie = df_missing['Area_Type'].value_counts().reset_index()
-        area_pie.columns = ['Area_Type','count']
-        st.bar_chart(area_pie.set_index('Area_Type'))
+        st.markdown("**Cells by remaining slots**")
+        slot_dist = df_missing.drop_duplicates('Source_Cell')['Slots_Available']
+        slot_bins = pd.cut(slot_dist, bins=[-0.1,0,5,10,20,64], labels=['0','1-5','6-10','11-20','21+'])
+        slot_counts = slot_bins.value_counts().sort_index().reset_index()
+        slot_counts.columns = ['Slots','Cells']
+        st.bar_chart(slot_counts.set_index('Slots'))
 
-    # Distance distribution
     st.markdown("**Distance distribution (km)**")
     dist_hist = pd.cut(df_missing['Distance_km'],
                        bins=[0,0.5,1,1.5,2,2.5,3,4,5],
@@ -549,13 +548,6 @@ with tab3:
     dist_counts.columns = ['range_km','count']
     st.bar_chart(dist_counts.set_index('range_km'))
 
-    # Priority breakdown
-    st.markdown("**Site-pair priority**")
-    prio = site_summary['priority'].value_counts().reset_index()
-    prio.columns = ['Priority','Count']
-    st.dataframe(prio, use_container_width=True, hide_index=True)
-
-    # Top 20 closest missing
     st.markdown("**Top 20 closest missing site pairs**")
     st.dataframe(
         site_summary.head(20)[['Source_SiteID','Target_SiteID','min_dist',
