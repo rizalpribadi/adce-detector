@@ -13,10 +13,8 @@ import pandas as pd
 import numpy as np
 from sklearn.neighbors import BallTree
 import math
-import json
 import folium
-from folium.plugins import Fullscreen, Search
-from branca.element import MacroElement, Template
+from folium.plugins import Fullscreen
 from streamlit_folium import st_folium
 
 st.set_page_config(
@@ -49,130 +47,6 @@ def draw_sector(layer, lat, lon, azimuth, beamwidth, radius_deg, color, fill_opa
     folium.Polygon(locations=points, color=color, weight=1.5,
                    fill=True, fill_color=color, fill_opacity=fill_opacity,
                    popup=folium.Popup(popup_text, max_width=350)).add_to(layer)
-
-
-def add_leaflet_html_control(m, html, position='bottomleft', class_name='adce-map-control'):
-    """Add a real Leaflet control, so it stays visible during fullscreen/maximize."""
-    control = MacroElement()
-    control._template = Template(f"""
-    {{% macro script(this, kwargs) %}}
-    var customControl = L.control({{position: '{position}'}});
-    customControl.onAdd = function(map) {{
-        var div = L.DomUtil.create('div', 'leaflet-control {class_name}');
-        div.innerHTML = {json.dumps(html)};
-        L.DomEvent.disableClickPropagation(div);
-        L.DomEvent.disableScrollPropagation(div);
-        return div;
-    }};
-    customControl.addTo({m.get_name()});
-    {{% endmacro %}}
-    """)
-    m.get_root().add_child(control)
-
-
-def add_radius_control(m, center_lat, center_lon, radius_km):
-    """Add a fullscreen-safe radius label/slider and visual circle inside the Folium map."""
-    map_name = m.get_name()
-    control_id = f"radius_control_{map_name}"
-    label_id = f"radius_label_{map_name}"
-    slider_id = f"radius_slider_{map_name}"
-    radius_m = float(radius_km) * 1000
-    control = MacroElement()
-    control._template = Template(f"""
-    {{% macro script(this, kwargs) %}}
-    var radiusCircle = L.circle([{float(center_lat):.8f}, {float(center_lon):.8f}], {{
-        radius: {radius_m:.2f},
-        color: '#2980b9',
-        weight: 1.7,
-        opacity: 0.9,
-        fill: false,
-        dashArray: '6,6'
-    }}).addTo({map_name});
-
-    var radiusControl = L.control({{position: 'topleft'}});
-    radiusControl.onAdd = function(map) {{
-        var div = L.DomUtil.create('div', 'leaflet-control adce-radius-control');
-        div.id = '{control_id}';
-        div.innerHTML = `
-            <div style="background:white;padding:8px 10px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.25);font-size:12px;line-height:1.4;min-width:185px;">
-                <b>Map radius</b>: <span id="{label_id}">{float(radius_km):.1f} km</span><br>
-                <input id="{slider_id}" type="range" min="0.5" max="10" step="0.5" value="{float(radius_km):.1f}" style="width:170px;">
-                <div style="font-size:10px;color:#666;margin-top:2px;">Visual radius in fullscreen</div>
-            </div>`;
-        L.DomEvent.disableClickPropagation(div);
-        L.DomEvent.disableScrollPropagation(div);
-        return div;
-    }};
-    radiusControl.addTo({map_name});
-
-    setTimeout(function() {{
-        var slider = document.getElementById('{slider_id}');
-        var label = document.getElementById('{label_id}');
-        if (slider && label) {{
-            slider.addEventListener('input', function(e) {{
-                var km = parseFloat(e.target.value);
-                label.innerHTML = km.toFixed(1) + ' km';
-                radiusCircle.setRadius(km * 1000);
-            }});
-        }}
-    }}, 0);
-    {{% endmacro %}}
-    """)
-    m.get_root().add_child(control)
-
-
-def add_siteid_search(m, gcell):
-    """Add SiteID search inside the Leaflet map so it is usable in fullscreen/maximize."""
-    site_points = (gcell.dropna(subset=['Latitude', 'Longitude'])
-                        .drop_duplicates('SiteID')
-                        [['SiteID', 'Latitude', 'Longitude', 'Kabupaten', 'BSC']])
-    features = []
-    for _, r in site_points.iterrows():
-        features.append({
-            'type': 'Feature',
-            'geometry': {
-                'type': 'Point',
-                'coordinates': [float(r['Longitude']), float(r['Latitude'])]
-            },
-            'properties': {
-                'site_id': str(r['SiteID']),
-                'kabupaten': str(r.get('Kabupaten', '')),
-                'bsc': str(r.get('BSC', ''))
-            }
-        })
-
-    if not features:
-        return
-
-    search_layer = folium.GeoJson(
-        {'type': 'FeatureCollection', 'features': features},
-        name='🔎 Search SiteID',
-        control=False,
-        show=True,
-        marker=folium.CircleMarker(
-            radius=4,
-            color='#2980b9',
-            weight=1,
-            opacity=0.0,
-            fill=True,
-            fill_opacity=0.0
-        ),
-        popup=folium.GeoJsonPopup(
-            fields=['site_id', 'kabupaten', 'bsc'],
-            aliases=['SiteID', 'Kabupaten', 'BSC'],
-            localize=True
-        )
-    ).add_to(m)
-
-    Search(
-        layer=search_layer,
-        search_label='site_id',
-        search_zoom=15,
-        geom_type='Point',
-        placeholder='Search SiteID...',
-        collapsed=False,
-        position='topleft'
-    ).add_to(m)
 
 @st.cache_data
 def load_gcell(file):
@@ -435,11 +309,6 @@ def build_map(gcell, adce_set, df_missing, focus_site, radius_km):
         title_cancel='Exit fullscreen',
         force_separate_button=True
     ).add_to(m)
-
-    # Fullscreen-safe controls: SiteID search + visual map radius inside the map.
-    add_siteid_search(m, gcell)
-    add_radius_control(m, center_lat, center_lon, radius_km)
-
     lg_sectors  = folium.FeatureGroup(name='📡 Cell sectors', show=True)
     lg_existing = folium.FeatureGroup(name='🟢 Existing ADCE', show=True)
     lg_cosite   = folium.FeatureGroup(name='🟣 Missing CO-SITE (priority)', show=True)
@@ -531,19 +400,16 @@ def build_map(gcell, adce_set, df_missing, focus_site, radius_km):
     lg_missing.add_to(m); lg_labels.add_to(m)
     folium.LayerControl(collapsed=False).add_to(m)
 
-    legend = f"""
-    <div style="background:white;padding:12px 16px;border-radius:10px;
-                box-shadow:0 2px 10px rgba(0,0,0,0.25);font-size:12px;
-                line-height:1.8;min-width:170px;">
+    legend = f"""<div style="position:fixed;bottom:30px;left:30px;z-index:1000;background:white;
+         padding:14px 18px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.25);
+         font-size:12px;line-height:2">
       <b style="font-size:14px">🗺️ {focus_site}</b><br>
       <span style="color:#e74c3c">■</span> Focus &nbsp;<span style="color:#27ae60">■</span> Neighbors<br>
       <span style="color:#2ecc71">━━</span> Existing ({len(existing_drawn)})<br>
       <span style="color:#8e44ad">━━</span> Missing co-site ({len(cosite_drawn)})<br>
-      <span style="color:#e74c3c">╌╌</span> Missing inter-site ({len(missing_drawn)})<br>
-      <span style="color:#2980b9">○</span> Radius {radius_km:.1f} km<br>
-      <span style="color:#777">Nearby sites: {len(nearby_sites)}</span>
+      <span style="color:#e74c3c">╌╌</span> Missing inter-site ({len(missing_drawn)})
     </div>"""
-    add_leaflet_html_control(m, legend, position='bottomleft', class_name='adce-legend-control')
+    m.get_root().html.add_child(folium.Element(legend))
     return m
 
 # ─── SIDEBAR ───
