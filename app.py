@@ -136,31 +136,77 @@ def detect_missing(gcell, adce_set_list, mode,
     for s, t in adce_set:
         src_existing_count[s] = src_existing_count.get(s, 0) + 1
 
+    # Build co-site lookup: SiteID -> list of cells in that site
+    cosite_cells = {}
+    for _, c in all_cells.iterrows():
+        cosite_cells.setdefault(c['SiteID'], []).append(c)
+
     missing = []
     for i, neighbors in enumerate(indices_list):
         src = src_cells.iloc[i]
         st_info = site_threshold.get(src['SiteID'], {'threshold_km': 5.0, 'area_type': 'Unknown'})
         threshold = st_info['threshold_km']
         area_type = str(st_info['area_type'])
+        existing_cnt = src_existing_count.get(src['LAC_CI'], 0)
 
-        cands = []
+        # ── CO-SITE (highest priority): every other sector in same site ──
+        cosite_cands = []
+        for tgt in cosite_cells.get(src['SiteID'], []):
+            if tgt['LAC_CI'] == src['LAC_CI']:
+                continue
+            if (src['LAC_CI'], tgt['LAC_CI']) in adce_set:
+                continue
+            dist = haversine(src['Latitude'], src['Longitude'], tgt['Latitude'], tgt['Longitude'])
+            cosite_cands.append((dist, tgt))
+        cosite_cands.sort(key=lambda x: x[0])
+        cosite_lacci = {t['LAC_CI'] for _, t in cosite_cands}
+
+        # ── INTER-SITE candidates (distance-filtered) ──
+        inter_cands = []
         for j in neighbors:
             tgt = all_cells.iloc[j]
             if src['SiteID'] == tgt['SiteID']:
+                continue
+            if tgt['LAC_CI'] in cosite_lacci:
                 continue
             dist = haversine(src['Latitude'], src['Longitude'], tgt['Latitude'], tgt['Longitude'])
             if dist > threshold:
                 continue
             if (src['LAC_CI'], tgt['LAC_CI']) in adce_set:
                 continue
-            cands.append((dist, tgt))
+            inter_cands.append((dist, tgt))
+        inter_cands.sort(key=lambda x: x[0])
 
-        cands.sort(key=lambda x: x[0])
-        existing_cnt = src_existing_count.get(src['LAC_CI'], 0)
+        # ── Allocate slots: co-site first, then inter-site by distance ──
         slots = max(0, max_neighbors - existing_cnt)
-        cands = cands[:slots]
+        cosite_take = cosite_cands[:slots]
+        remaining = max(0, slots - len(cosite_take))
+        inter_take = inter_cands[:remaining]
 
-        for rank, (dist, tgt) in enumerate(cands, start=1):
+        # Co-site rows: Priority_Rank = 0 (top priority)
+        for (dist, tgt) in cosite_take:
+            missing.append({
+                'Source_Cell': src['Cellname'],
+                'Source_SiteID': src['SiteID'],
+                'Source_LAC_CI': src['LAC_CI'],
+                'Source_Azimuth': int(src['azimuth']),
+                'Source_BSC': src['BSC'],
+                'Existing_Neighbors': existing_cnt,
+                'Slots_Available': slots,
+                'Priority_Rank': 0,
+                'Relation_Type': 'CO-SITE',
+                'Target_Cell': tgt['Cellname'],
+                'Target_SiteID': tgt['SiteID'],
+                'Target_LAC_CI': tgt['LAC_CI'],
+                'Target_Azimuth': int(tgt['azimuth']),
+                'Distance_km': round(dist, 2),
+                'Kabupaten': src['Kabupaten'],
+                'Area_Type': area_type,
+                'Threshold_km': threshold,
+            })
+
+        # Inter-site rows: Priority_Rank = 1, 2, 3, ... by distance
+        for rank, (dist, tgt) in enumerate(inter_take, start=1):
             missing.append({
                 'Source_Cell': src['Cellname'],
                 'Source_SiteID': src['SiteID'],
@@ -170,6 +216,7 @@ def detect_missing(gcell, adce_set_list, mode,
                 'Existing_Neighbors': existing_cnt,
                 'Slots_Available': slots,
                 'Priority_Rank': rank,
+                'Relation_Type': 'INTER-SITE',
                 'Target_Cell': tgt['Cellname'],
                 'Target_SiteID': tgt['SiteID'],
                 'Target_LAC_CI': tgt['LAC_CI'],
@@ -193,6 +240,7 @@ def detect_missing(gcell, adce_set_list, mode,
     site_summary = df_missing.groupby(['Source_SiteID','Target_SiteID']).agg(
         missing_count=('Source_Cell','size'),
         min_dist=('Distance_km','min'),
+        relation_type=('Relation_Type','first'),
         area_type=('Area_Type','first'),
         threshold_km=('Threshold_km','first'),
         kabupaten=('Kabupaten','first'),
@@ -205,11 +253,20 @@ def detect_missing(gcell, adce_set_list, mode,
         how='left'
     ).drop(columns=['src_site','tgt_site'], errors='ignore')
     site_summary['existing_count'] = site_summary['existing_count'].fillna(0).astype(int)
-    site_summary['priority'] = site_summary['existing_count'].apply(
-        lambda x: 'CRITICAL' if x == 0 else 'PARTIAL')
+    # Priority: CO-SITE always top, then CRITICAL (zero inter-site), then PARTIAL
+    def prio(row):
+        if row['relation_type'] == 'CO-SITE':
+            return 'CO-SITE'
+        return 'CRITICAL' if row['existing_count'] == 0 else 'PARTIAL'
+    site_summary['priority'] = site_summary.apply(prio, axis=1)
+
+    # Sort: co-site rank 0 first, then by priority rank ascending
+    prio_order = {'CO-SITE': 0, 'CRITICAL': 1, 'PARTIAL': 2}
+    site_summary['_prio'] = site_summary['priority'].map(prio_order)
+    site_summary = site_summary.sort_values(['_prio','min_dist']).drop(columns='_prio')
 
     return df_missing.sort_values(['Source_BSC','Source_SiteID','Source_Cell','Priority_Rank']), \
-           site_summary.sort_values(['priority','min_dist'])
+           site_summary
 
 
 def build_map(gcell, adce_set, df_missing, focus_site, radius_km):
@@ -233,16 +290,21 @@ def build_map(gcell, adce_set, df_missing, focus_site, radius_km):
             'name': c['Cellname'], 'site': c['SiteID']
         }
 
-    missing_pairs = set()
+    missing_pairs = set()      # inter-site
+    cosite_pairs = set()       # co-site (same site)
     if df_missing is not None and len(df_missing) > 0:
         focus_missing = df_missing[df_missing['Source_SiteID'] == focus_site]
         for _, row in focus_missing.iterrows():
-            missing_pairs.add((row['Source_LAC_CI'], row['Target_LAC_CI']))
+            if row.get('Relation_Type') == 'CO-SITE':
+                cosite_pairs.add((row['Source_LAC_CI'], row['Target_LAC_CI']))
+            else:
+                missing_pairs.add((row['Source_LAC_CI'], row['Target_LAC_CI']))
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=15, tiles='CartoDB positron')
     lg_sectors  = folium.FeatureGroup(name='📡 Cell sectors', show=True)
     lg_existing = folium.FeatureGroup(name='🟢 Existing ADCE', show=True)
-    lg_missing  = folium.FeatureGroup(name='🔴 Missing ADCE (prioritized)', show=True)
+    lg_cosite   = folium.FeatureGroup(name='🟣 Missing CO-SITE (priority)', show=True)
+    lg_missing  = folium.FeatureGroup(name='🔴 Missing inter-site', show=True)
     lg_labels   = folium.FeatureGroup(name='🏷️ Site labels', show=True)
 
     BEAM_LEN = 0.0012
@@ -292,6 +354,24 @@ def build_map(gcell, adce_set, df_missing, focus_site, radius_km):
                             color='#2ecc71', weight=2.5, opacity=0.85, dash_array='8,4',
                             popup=folium.Popup(popup, max_width=300)).add_to(lg_existing)
 
+    # ── Missing CO-SITE lines (purple, thick) — drawn between sector tips of same site ──
+    cosite_drawn = set()
+    for src_lacci, tgt_lacci in cosite_pairs:
+        src = cell_info.get(src_lacci)
+        tgt = cell_info.get(tgt_lacci)
+        if not src or not tgt: continue
+        key = tuple(sorted([src_lacci, tgt_lacci]))
+        if key in cosite_drawn: continue
+        cosite_drawn.add(key)
+        # Draw between sector beam tips (push further out so the line is visible around the site)
+        src_tip = az_offset(src['lat'], src['lon'], src['az'], LINE_OFFSET*1.5)
+        tgt_tip = az_offset(tgt['lat'], tgt['lon'], tgt['az'], LINE_OFFSET*1.5)
+        popup = (f"🟣 <b>MISSING CO-SITE</b><br><b>Src:</b> {src['name']}<br>"
+                 f"<b>Tgt:</b> {tgt['name']}<br>Same site — top priority")
+        folium.PolyLine(locations=[src_tip, tgt_tip],
+                        color='#8e44ad', weight=3.5, opacity=0.9,
+                        popup=folium.Popup(popup, max_width=300)).add_to(lg_cosite)
+
     missing_drawn = set()
     for src_lacci, tgt_lacci in missing_pairs:
         src = cell_info.get(src_lacci)
@@ -308,7 +388,8 @@ def build_map(gcell, adce_set, df_missing, focus_site, radius_km):
                         color='#e74c3c', weight=2, opacity=0.7, dash_array='4,6',
                         popup=folium.Popup(popup, max_width=300)).add_to(lg_missing)
 
-    lg_sectors.add_to(m); lg_existing.add_to(m); lg_missing.add_to(m); lg_labels.add_to(m)
+    lg_sectors.add_to(m); lg_existing.add_to(m); lg_cosite.add_to(m)
+    lg_missing.add_to(m); lg_labels.add_to(m)
     folium.LayerControl(collapsed=False).add_to(m)
 
     legend = f"""<div style="position:fixed;bottom:30px;left:30px;z-index:1000;background:white;
@@ -316,8 +397,9 @@ def build_map(gcell, adce_set, df_missing, focus_site, radius_km):
          font-size:12px;line-height:2">
       <b style="font-size:14px">🗺️ {focus_site}</b><br>
       <span style="color:#e74c3c">■</span> Focus &nbsp;<span style="color:#27ae60">■</span> Neighbors<br>
-      <span style="color:#2ecc71">━━</span> Existing ({len(existing_drawn)}) &nbsp;
-      <span style="color:#e74c3c">╌╌</span> Missing ({len(missing_drawn)})
+      <span style="color:#2ecc71">━━</span> Existing ({len(existing_drawn)})<br>
+      <span style="color:#8e44ad">━━</span> Missing co-site ({len(cosite_drawn)})<br>
+      <span style="color:#e74c3c">╌╌</span> Missing inter-site ({len(missing_drawn)})
     </div>"""
     m.get_root().html.add_child(folium.Element(legend))
     return m
