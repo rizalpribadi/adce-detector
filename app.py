@@ -14,6 +14,7 @@ import numpy as np
 from sklearn.neighbors import BallTree
 import math
 import folium
+from folium.plugins import Fullscreen
 from streamlit_folium import st_folium
 
 st.set_page_config(
@@ -301,6 +302,13 @@ def build_map(gcell, adce_set, df_missing, focus_site, radius_km):
                 missing_pairs.add((row['Source_LAC_CI'], row['Target_LAC_CI']))
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=15, tiles='CartoDB positron')
+    # Add maximize/fullscreen control without changing the original map structure.
+    Fullscreen(
+        position='topright',
+        title='Maximize map',
+        title_cancel='Exit fullscreen',
+        force_separate_button=True
+    ).add_to(m)
     lg_sectors  = folium.FeatureGroup(name='📡 Cell sectors', show=True)
     lg_existing = folium.FeatureGroup(name='🟢 Existing ADCE', show=True)
     lg_cosite   = folium.FeatureGroup(name='🟣 Missing CO-SITE (priority)', show=True)
